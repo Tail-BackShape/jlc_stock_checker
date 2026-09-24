@@ -1,0 +1,17 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "Origin", "operation": "set", "value": "https://jlcpcb.com" },
+        { "header": "Referer", "operation": "set", "value": "https://jlcpcb.com/parts" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||jlcpcb.com/api/overseas-pcb-order/",
+      "resourceTypes": ["xmlhttprequest"]
+    }
+  }
+]

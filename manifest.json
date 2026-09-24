@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "JLCPCB Parts Quick Look",
+  "version": "0.1.0",
+  "description": "Highlight a part number on any page to check JLCPCB parts-library stock and unit price in place - no new tab needed.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "JLCPCB Parts Quick Look"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["storage", "declarativeNetRequest"],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ruleset_1",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "host_permissions": ["https://jlcpcb.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/*.png"],
+      "matches": ["http://*/*", "https://*/*"]
+    }
+  ]
+}
