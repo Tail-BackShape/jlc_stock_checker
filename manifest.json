@@ -13,7 +13,8 @@
     "default_title": "JLCPCB Parts Quick Look"
   },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "permissions": ["storage", "declarativeNetRequest"],
   "declarative_net_request": {
@@ -25,7 +26,12 @@
       }
     ]
   },
-  "host_permissions": ["https://jlcpcb.com/*"],
+  "host_permissions": [
+    "https://jlcpcb.com/*",
+    "https://akizukidenshi.com/*",
+    "https://api.digikey.com/*"
+  ],
+  "options_page": "options.html",
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],

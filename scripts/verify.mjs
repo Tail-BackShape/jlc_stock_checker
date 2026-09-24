@@ -2,7 +2,7 @@
 //
 // Headless Chrome does not inject extension content scripts reliably, so this
 // script injects content.js itself via Page.addScriptToEvaluateOnNewDocument,
-// with a chrome.* stub whose sendMessage calls the real JLCPCB API from Node.
+// with a chrome.* stub whose sendMessage calls the real vendor APIs from Node.
 // The UI code under test is exactly the shipped content.js.
 //
 // Prereq: Chrome running with --headless=new --remote-debugging-port=9222.
@@ -12,6 +12,10 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { extname, join } from "node:path";
+
+import { search as jlcSearch } from "../sources/jlcpcb.js";
+import { search as akizukiSearch } from "../sources/akizuki.js";
+import { search as digikeySearch } from "../sources/digikey.js";
 
 const CDP_PORT = 9222;
 const HTTP_PORT = 8765;
@@ -23,84 +27,13 @@ const MIME = {
   ".png": "image/png",
 };
 
-const SEARCH_URL =
-  "https://jlcpcb.com/api/overseas-pcb-order/v1/shoppingCart/smtGood/selectSmtComponentList/v2";
+const SOURCES = [
+  { id: "jlcpcb", label: "JLCPCB", urlTemplate: "https://jlcpcb.com/parts/componentSearch?searchTxt={q}" },
+  { id: "akizuki", label: "秋月", urlTemplate: "https://akizukidenshi.com/catalog/goods/search.aspx?search=keyword&keyword={q}" },
+  { id: "digikey", label: "DigiKey", urlTemplate: "https://www.digikey.jp/ja/products/result?keywords={q}" },
+];
 
-// Same normalization as background.js (kept in sync for the harness).
-const LIB_LABEL = { base: "Basic", expand: "Extended" };
-function normalizePrices(list) {
-  if (!Array.isArray(list)) return [];
-  const sorted = list
-    .filter(
-      (p) =>
-        p && typeof p.startNumber === "number" && typeof p.productPrice === "number"
-    )
-    .map((p) => ({
-      start: p.startNumber,
-      end: typeof p.endNumber === "number" ? p.endNumber : -1,
-      price: p.productPrice,
-    }))
-    .sort((a, b) => a.start - b.start);
-  const merged = [];
-  for (const row of sorted) {
-    const prev = merged[merged.length - 1];
-    if (prev && prev.price === row.price && row.start <= prev.end + 1)
-      prev.end = row.end;
-    else merged.push({ ...row });
-  }
-  return merged.slice(0, 6);
-}
-function pickComponent(c) {
-  return {
-    code: c.componentCode ?? null,
-    mpn: c.componentModelEn ?? "",
-    brand: c.componentBrandEn ?? "",
-    package: c.componentSpecificationEn ?? "",
-    category: c.firstSortName ?? c.componentTypeEn ?? "",
-    stock: typeof c.stockCount === "number" ? c.stockCount : null,
-    libType: LIB_LABEL[c.componentLibraryType] || c.componentLibraryType || null,
-    prices: normalizePrices(c.componentPrices),
-    moq:
-      typeof c.minPurchaseNum === "number" && c.minPurchaseNum > 1
-        ? c.minPurchaseNum
-        : null,
-    productUrl: c.componentCode
-      ? "https://jlcpcb.com/partdetail/" + c.componentCode
-      : c.lcscGoodsUrl || null,
-    canBuy: c.isBuyComponent !== "0",
-    noBuyReason: c.noBuyReason || null,
-  };
-}
-async function apiSearch(keyword) {
-  const res = await fetch(SEARCH_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      currentPage: 1,
-      pageSize: 8,
-      keyword,
-      searchSource: "search",
-      presaleType: "stock",
-      searchType: 2,
-    }),
-  });
-  const j = await res.json();
-  const info = (j.data && j.data.componentPageInfo) || {};
-  const raw = Array.isArray(info.list) ? info.list : [];
-  const seen = new Set();
-  const results = [];
-  for (const c of raw) {
-    const key = c.componentCode || c.componentId;
-    if (key == null || seen.has(key)) continue;
-    seen.add(key);
-    results.push(pickComponent(c));
-  }
-  return {
-    ok: j.code === 200,
-    total: typeof info.total === "number" ? info.total : results.length,
-    results,
-  };
-}
+const SEARCHERS = { jlcpcb: jlcSearch, akizuki: akizukiSearch, digikey: digikeySearch };
 
 // --- tiny static server so the page runs on http:// (not file://) ---
 const server = http.createServer(async (req, res) => {
@@ -155,13 +88,19 @@ ws.onmessage = (e) => {
     pending.get(m.id)(m);
     pending.delete(m.id);
   } else if (m.method === "Runtime.bindingCalled") {
-    // Bridge: page called __jlcSearch(json) -> run real API, resolve in page.
-    const msg = JSON.parse(m.params.payload);
-    apiSearch(msg.keyword)
+    const incoming = JSON.parse(m.params.payload);
+    const callId = incoming.__id;
+    const msg = { ...incoming };
+    delete msg.__id;
+    handleMessage(msg)
       .then((r) =>
         send("Runtime.evaluate", {
           expression:
-            "window.__jlcResolve(" + JSON.stringify(JSON.stringify(r)) + ")",
+            "window.__jlcResolve(" +
+            JSON.stringify(callId) +
+            "," +
+            JSON.stringify(JSON.stringify(r)) +
+            ")",
         })
       )
       .catch(() => {});
@@ -184,18 +123,36 @@ const evalJs = async (expression) => {
   return r.result && r.result.result ? r.result.result.value : undefined;
 };
 
+async function handleMessage(msg) {
+  if (msg.type === "JLC_SOURCES") {
+    return { ok: true, sources: SOURCES };
+  }
+  if (msg.type === "JLC_SEARCH") {
+    const fn = SEARCHERS[msg.source];
+    if (!fn) return { ok: false, error: "unknown source" };
+    try {
+      const { total, results } = await fn(msg.keyword, { settings: {} });
+      return { ok: true, total, results };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+  return { ok: false, error: "unknown message" };
+}
+
 await send("Page.enable");
 await send("Runtime.enable");
 await send("Runtime.addBinding", { name: "__jlcSearch" });
 
-// Inject chrome.* stub + content.js into every new document.
 const stub =
-  "window.__jlcQueue=[];" +
-  "window.__jlcResolve=function(payload){var f=window.__jlcQueue.shift();if(f)f(payload);};" +
-  "window.chrome={runtime:{" +
+  "window.__jlcMap={};window.__jlcSeq=0;" +
+  "window.__jlcResolve=function(id,payload){var f=window.__jlcMap[id];if(f){delete window.__jlcMap[id];f(payload);}};" +
+  "window.chrome={runtime:{id:'test-ext'," +
   "getURL:function(p){return 'http://127.0.0.1:" + HTTP_PORT + "/'+p;}," +
   "sendMessage:function(msg,cb){" +
-  "  new Promise(function(res){window.__jlcQueue.push(res);__jlcSearch(JSON.stringify(msg));})" +
+  "  var k='c'+(++window.__jlcSeq);" +
+  "  var payload=Object.assign({__id:k},msg);" +
+  "  new Promise(function(res){window.__jlcMap[k]=res;__jlcSearch(JSON.stringify(payload));})" +
   "    .then(function(p){cb(JSON.parse(p));}).catch(function(){cb(null);});" +
   "}}};";
 await send("Page.addScriptToEvaluateOnNewDocument", { source: stub });
@@ -256,53 +213,66 @@ async function pressEscape() {
     "document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));true"
   );
 }
+async function clickTab(index) {
+  return evalJs(
+    "(function(){var h=document.getElementById('jlcpcb-quicklook-host');" +
+      "var t=h.shadowRoot.querySelectorAll('.jlc-tab');" +
+      "if(!t[" + index + "])return false;t[" + index + "].click();return true;})()"
+  );
+}
 
-// 1. MPN selection -> floating button -> detail card.
+// 1. MPN selection -> floating button -> JLCPCB detail card.
 const selected = await selectCode(0);
 check("select text", selected === "STM32H743ZIT6", String(selected));
 await delay(250);
 const bv = await btnVisible();
 check("floating button appears", bv === "flex", String(bv));
 await clickBtn();
-await delay(4000);
+await delay(5000);
 let text = await popText();
 check(
-  "detail card shows LCSC code",
+  "JLCPCB detail card shows LCSC code",
   text && text.includes("C114408"),
-  (text || "").slice(0, 140).replace(/\n/g, " / ")
+  (text || "").slice(0, 160).replace(/\n/g, " / ")
 );
-check("detail card shows price", text && /\$\d/.test(text), "");
-check("detail card shows stock", text && /pcs|Out of stock/i.test(text), "");
-await pressEscape();
-await delay(200);
+check("JLCPCB shows price", text && /\$\d/.test(text), "");
+check("JLCPCB shows stock", text && /pcs|Out of stock/i.test(text), "");
+check("tabs rendered", text && /JLCPCB/.test(text) && /秋月/.test(text), "");
 
-// 2. LCSC code search.
-await selectCode(1);
+// 2. Akizuki tab - re-select a part Akizuki actually sells.
+await pressEscape();
+await delay(300);
+await evalJs(
+  "(function(){var ns=document.querySelectorAll('code');" +
+    "var n=[...ns].find(x=>x.textContent==='PIC16F1827');" +
+    "if(!n)return false;var r=document.createRange();r.selectNodeContents(n);" +
+    "var s=getSelection();s.removeAllRanges();s.addRange(r);" +
+    "document.dispatchEvent(new PointerEvent('pointerup',{bubbles:true}));" +
+    "return s.toString();})()"
+);
 await delay(250);
 await clickBtn();
+await delay(5000);
+await clickTab(1);
 await delay(4000);
 text = await popText();
 check(
-  "LCSC code search -> C114408",
-  text && text.includes("C114408"),
-  (text || "").slice(0, 140).replace(/\n/g, " / ")
+  "Akizuki shows result",
+  text && /104430|在庫|\u00a5|￥|円/.test(text),
+  (text || "").slice(0, 160).replace(/\n/g, " / ")
 );
-await pressEscape();
-await delay(200);
 
-// 3. Fuzzy search -> candidate list.
-await selectCode(2);
-await delay(250);
-await clickBtn();
-await delay(4000);
+// 3. DigiKey tab -> expected credentials error.
+await clickTab(2);
+await delay(1500);
 text = await popText();
-const codes = (text || "").match(/C\d{4,}/g) || [];
 check(
-  "fuzzy search shows candidates",
-  codes.length >= 3,
-  codes.join(",") + " | " + (text || "").slice(0, 140).replace(/\n/g, " / ")
+  "DigiKey shows credentials error",
+  text && /credentials|developer\.digikey/i.test(text),
+  (text || "").slice(0, 160).replace(/\n/g, " / ")
 );
 
+await pressEscape();
 ws.close();
 server.close();
 

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>JLCPCB Parts Quick Look - Options</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 32px auto; padding: 0 16px; color: #1f2937; }
+  h1 { font-size: 18px; }
+  fieldset { border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 16px; margin: 16px 0; }
+  legend { font-weight: 600; font-size: 13px; padding: 0 6px; }
+  label { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 14px; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px;
+    font: inherit; font-size: 13px; box-sizing: border-box;
+  }
+  .hint { color: #6b7280; font-size: 12px; margin: 4px 0 0; }
+  .row { margin: 10px 0; }
+  button {
+    background: #2563eb; color: #fff; border: none; border-radius: 8px;
+    padding: 8px 18px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:hover { background: #1d4ed8; }
+  #status { margin-left: 10px; color: #15803d; font-size: 13px; }
+  a { color: #2563eb; }
+</style>
+</head>
+<body>
+  <h1>JLCPCB Parts Quick Look - Options</h1>
+
+  <fieldset>
+    <legend>検索するサイト</legend>
+    <label><input type="checkbox" id="src-jlcpcb"> JLCPCB パーツライブラリ</label>
+    <label><input type="checkbox" id="src-akizuki"> 秋月電子通商</label>
+    <label><input type="checkbox" id="src-digikey"> DigiKey（要 API 設定）</label>
+  </fieldset>
+
+  <fieldset>
+    <legend>DigiKey API</legend>
+    <div class="row">
+      <label style="display:block">Client ID
+        <input type="text" id="dk-client-id" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+    <div class="row">
+      <label style="display:block">Client Secret
+        <input type="password" id="dk-client-secret" autocomplete="off">
+      </label>
+    </div>
+    <p class="hint">
+      <a href="https://developer.digikey.com/" target="_blank" rel="noopener">developer.digikey.com</a>
+      で無料アカウントを作成し、Production App を作ると Client ID / Secret が発行されます。
+      設定しない場合、DigiKey タブは「未設定」エラーになります。
+    </p>
+  </fieldset>
+
+  <button id="save">保存</button><span id="status"></span>
+
+  <script src="options.js"></script>
+</body>
+</html>

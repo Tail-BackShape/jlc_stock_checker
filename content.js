@@ -1,6 +1,7 @@
 // JLCPCB Parts Quick Look - content script.
 // Shows a DeepL-style floating button next to a text selection; clicking it
-// opens a popover with JLCPCB parts-library stock and pricing.
+// opens a popover with per-vendor tabs (JLCPCB / Akizuki / DigiKey) showing
+// stock and pricing.
 
 "use strict";
 
@@ -8,7 +9,7 @@
   const HOST_ID = "jlcpcb-quicklook-host";
   if (document.getElementById(HOST_ID)) return;
 
-  const POPOVER_WIDTH = 340;
+  const POPOVER_WIDTH = 360;
   const MAX_CANDIDATES = 6;
 
   const CSS = [
@@ -34,6 +35,16 @@
     ".jlc-x { border: none; background: none; color: #94a3b8; font-size: 16px; line-height: 1;",
     "  cursor: pointer; padding: 2px 4px; border-radius: 4px; }",
     ".jlc-x:hover { color: #1f2937; background: #e2e8f0; }",
+    "",
+    ".jlc-tabs { display: flex; border-bottom: 1px solid #e5e7eb; background: #fff; }",
+    ".jlc-tab { flex: 1; border: none; background: none; padding: 7px 4px; font: inherit;",
+    "  font-size: 12px; font-weight: 600; color: #64748b; cursor: pointer;",
+    "  border-bottom: 2px solid transparent; }",
+    ".jlc-tab:hover { color: #1f2937; }",
+    ".jlc-tab.active { color: #2563eb; border-bottom-color: #2563eb; }",
+    ".jlc-tab .cnt { font-weight: 500; font-size: 10px; color: #94a3b8; }",
+    ".jlc-tab.err { color: #b91c1c; }",
+    "",
     ".jlc-body { padding: 10px 12px 12px; max-height: 380px; overflow-y: auto; }",
     "",
     ".jlc-status { padding: 14px 4px; color: #64748b; text-align: center; }",
@@ -50,6 +61,10 @@
     ".jlc-row-side { text-align: right; flex-shrink: 0; }",
     ".jlc-row-price { font-weight: 600; font-size: 12px; }",
     ".jlc-caret { color: #94a3b8; font-size: 14px; flex-shrink: 0; }",
+    "",
+    ".jlc-back { border: none; background: none; color: #2563eb; font-size: 11px;",
+    "  font-weight: 600; cursor: pointer; padding: 0 0 6px; font-family: inherit; }",
+    ".jlc-back:hover { text-decoration: underline; }",
     "",
     ".jlc-detail-head { display: flex; gap: 10px; align-items: flex-start; }",
     ".jlc-thumb { width: 44px; height: 44px; flex-shrink: 0; object-fit: contain;",
@@ -146,6 +161,9 @@
   let anchorRect = null;  // fallback rect (viewport coords)
   let reqSeq = 0;
   let popOpen = false;
+  let sources = null; // [{id,label,urlTemplate}]
+  let activeTab = 0;
+  const tabState = new Map(); // sourceId -> {status,results,total,error,detail}
 
   // ---------- Helpers ----------
 
@@ -172,20 +190,35 @@
     return s + "\u2013" + end.toLocaleString();
   }
 
-  function fmtPrice(p) {
+  function fmtPrice(p, currency) {
     if (!p || p.price == null) return "\u2014";
-    return "$" + Number(p.price).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+    const sym = currency === "JPY" ? "\u00a5" : "$";
+    const n = Number(p.price);
+    const str =
+      currency === "JPY"
+        ? Math.round(n).toLocaleString()
+        : n.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+    return sym + str;
   }
 
   function firstPrice(comp) {
-    return comp.prices && comp.prices.length ? fmtPrice(comp.prices[0]) : "\u2014";
+    return comp.prices && comp.prices.length
+      ? fmtPrice(comp.prices[0], comp.currency)
+      : "\u2014";
   }
 
   function stockLabel(comp) {
-    if (comp.stock == null) return { text: "\u2014", ok: false };
-    if (comp.stock > 0)
+    if (comp.stock != null && comp.stock > 0)
       return { text: comp.stock.toLocaleString() + " pcs", ok: true };
-    return { text: "Out of stock", ok: false };
+    if (comp.stock === 0) {
+      const t = comp.stockText || "Out of stock";
+      return { text: t === "在庫あり" ? "Out of stock" : t, ok: false };
+    }
+    if (comp.stockText) {
+      const ok = /在庫あり|在庫多数/.test(comp.stockText);
+      return { text: comp.stockText, ok };
+    }
+    return { text: "\u2014", ok: false };
   }
 
   function libBadge(comp) {
@@ -329,7 +362,6 @@
 
   // ---------- Events ----------
 
-  // Keep the selection alive when the floating button is pressed.
   btn.addEventListener("pointerdown", (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -344,7 +376,7 @@
   document.addEventListener(
     "pointerdown",
     (e) => {
-      if (e.target === host) return; // click inside our UI (retargeted to host)
+      if (e.target === host) return;
       if (popOpen) closePopover();
       hideButton();
     },
@@ -370,65 +402,105 @@
     { capture: true, passive: true }
   );
 
+  // ---------- Messaging ----------
+
+  function sendMsg(payload) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(payload, (res) => {
+          if (chrome.runtime.lastError) {
+            resolve({
+              ok: false,
+              error: chrome.runtime.lastError.message || "Extension error",
+              invalidated:
+                (chrome.runtime.lastError.message || "").indexOf(
+                  "invalidated"
+                ) >= 0,
+            });
+            return;
+          }
+          resolve(res || { ok: false, error: "No response" });
+        });
+      } catch (e) {
+        resolve({ ok: false, error: String(e && e.message || e), invalidated: true });
+      }
+    });
+  }
+
   // ---------- Popover ----------
 
-  function openPopover(keyword) {
+  async function openPopover(keyword) {
     if (!keyword) return;
     popOpen = true;
     hideButton();
 
-    // After the extension is reloaded/updated, this content script's runtime
-    // context is invalidated: sendMessage throws synchronously and the popover
-    // would otherwise stay on "Searching..." forever.
     if (!chrome.runtime || !chrome.runtime.id) {
-      renderError(
+      renderFatal(
         "Extension was reloaded. Please refresh this page (F5) and try again."
       );
-      placePopover();
       return;
     }
 
-    renderLoading(keyword);
-    placePopover();
-    const seq = ++reqSeq;
-
-    let settled = false;
-    const timeout = setTimeout(() => {
-      if (settled || seq !== reqSeq || !popOpen) return;
-      settled = true;
-      renderError("Request timed out. Please try again.");
-    }, 20000);
-
-    const onResponse = (res) => {
-      if (settled || seq !== reqSeq || !popOpen) return;
-      settled = true;
-      clearTimeout(timeout);
-      if (chrome.runtime.lastError || !res) {
-        const msg = chrome.runtime.lastError
-          ? chrome.runtime.lastError.message
-          : "";
-        renderError(
-          msg && msg.indexOf("invalidated") >= 0
-            ? "Extension was reloaded. Please refresh this page (F5) and try again."
-            : "Extension error: could not reach the background worker."
+    if (!sources) {
+      const res = await sendMsg({ type: "JLC_SOURCES" });
+      if (res.invalidated) {
+        renderFatal(
+          "Extension was reloaded. Please refresh this page (F5) and try again."
         );
         return;
       }
-      if (!res.ok) {
-        renderError(res.error || "Request failed.");
+      sources = res.sources && res.sources.length ? res.sources : null;
+      if (!sources) {
+        renderFatal(
+          "No sources enabled. Open the extension options to enable at least one."
+        );
         return;
       }
-      renderResults(res);
-    };
-
-    try {
-      chrome.runtime.sendMessage({ type: "JLC_SEARCH", keyword }, onResponse);
-    } catch (e) {
-      clearTimeout(timeout);
-      renderError(
-        "Extension was reloaded. Please refresh this page (F5) and try again."
-      );
     }
+
+    const seq = ++reqSeq;
+    tabState.clear();
+    for (const s of sources) tabState.set(s.id, { status: "loading" });
+    activeTab = 0;
+    renderShell();
+
+    // Fire all enabled sources in parallel; each updates its own tab.
+    sources.forEach((s, i) => {
+      sendMsg({ type: "JLC_SEARCH", source: s.id, keyword }).then((res) => {
+        if (seq !== reqSeq || !popOpen) return;
+        if (res.invalidated) {
+          renderFatal(
+            "Extension was reloaded. Please refresh this page (F5) and try again."
+          );
+          return;
+        }
+        if (!res.ok) {
+          tabState.set(s.id, {
+            status: "error",
+            error: res.error || "Request failed",
+          });
+        } else {
+          tabState.set(s.id, {
+            status: "done",
+            results: res.results || [],
+            total: res.total,
+          });
+        }
+        renderShell();
+      });
+    });
+  }
+
+  function renderFatal(message) {
+    pop.textContent = "";
+    pop.append(buildHead(), fatalBody(message));
+    placePopover();
+  }
+
+  function fatalBody(message) {
+    const body = el("div", "jlc-body");
+    body.append(el("div", "jlc-status jlc-err", message));
+    return body;
   }
 
   function buildHead() {
@@ -458,13 +530,38 @@
     return head;
   }
 
+  function buildTabs() {
+    const bar = el("div", "jlc-tabs");
+    sources.forEach((s, i) => {
+      const st = tabState.get(s.id) || {};
+      const t = el("button", "jlc-tab" + (i === activeTab ? " active" : "") +
+        (st.status === "error" ? " err" : ""));
+      t.type = "button";
+      let label = s.label;
+      if (st.status === "loading") label += " \u2026";
+      else if (st.status === "done")
+        label += " (" + (st.total != null ? st.total : st.results.length) + ")";
+      else if (st.status === "error") label += " !";
+      t.textContent = label;
+      t.addEventListener("click", () => {
+        activeTab = i;
+        renderShell();
+      });
+      bar.append(t);
+    });
+    return bar;
+  }
+
   function buildFoot() {
     const foot = el("div", "jlc-foot");
-    const left = el("span", null, "JLCPCB Parts Library");
+    const s = sources && sources[activeTab];
+    const left = el("span", null, s ? s.label + " search" : "");
     const right = document.createElement("a");
-    right.href =
-      "https://jlcpcb.com/parts/componentSearch?searchTxt=" +
-      encodeURIComponent(currentKeyword || "");
+    if (s && s.urlTemplate) {
+      right.href = s.urlTemplate.replace("{q}", encodeURIComponent(currentKeyword || ""));
+    } else {
+      right.href = "#";
+    }
     right.target = "_blank";
     right.rel = "noopener noreferrer";
     right.textContent = "View all results \u2197";
@@ -472,77 +569,85 @@
     return foot;
   }
 
-  function renderShell(bodyNode) {
+  function renderShell() {
     pop.textContent = "";
-    pop.append(buildHead(), bodyNode, buildFoot());
+    pop.append(buildHead());
+    if (sources && sources.length > 1) pop.append(buildTabs());
+    pop.append(buildActiveBody(), buildFoot());
     placePopover();
   }
 
-  function renderLoading(keyword) {
+  function buildActiveBody() {
+    const s = sources[activeTab];
+    const st = tabState.get(s.id) || { status: "loading" };
     const body = el("div", "jlc-body");
-    body.append(
-      el("div", "jlc-status", "Searching JLCPCB for \u201c" + keyword + "\u201d\u2026")
-    );
-    renderShell(body);
-  }
 
-  function renderError(message) {
-    const body = el("div", "jlc-body");
-    body.append(el("div", "jlc-status jlc-err", message));
-    renderShell(body);
-  }
-
-  function renderResults(res) {
-    const list = res.results || [];
-    if (list.length === 0) {
-      const body = el("div", "jlc-body");
+    if (st.status === "loading") {
       body.append(
-        el("div", "jlc-status", "No parts found for \u201c" + currentKeyword + "\u201d.")
+        el("div", "jlc-status", "Searching " + s.label + " for \u201c" + currentKeyword + "\u201d\u2026")
       );
-      renderShell(body);
-      return;
+      return body;
+    }
+    if (st.status === "error") {
+      body.append(el("div", "jlc-status jlc-err", st.error));
+      return body;
+    }
+    if (st.detail) {
+      renderDetailInto(body, st.detail, s, st);
+      return body;
+    }
+    const list = st.results || [];
+    if (list.length === 0) {
+      body.append(
+        el("div", "jlc-status", "No parts found on " + s.label + ".")
+      );
+      return body;
     }
     if (list.length === 1) {
-      renderDetail(list[0]);
-      return;
+      st.detail = list[0];
+      renderDetailInto(body, st.detail, s, st);
+      return body;
     }
-    renderCandidates(list, res.total);
-  }
-
-  function renderCandidates(list, total) {
-    const body = el("div", "jlc-body");
     for (const comp of list.slice(0, MAX_CANDIDATES)) {
       const row = el("button", "jlc-row");
       row.type = "button";
-
       const main = el("div", "jlc-row-main");
       main.append(el("div", "jlc-row-mpn", comp.mpn || comp.code || "?"));
       const sub = [comp.code, comp.brand, comp.package]
         .filter(Boolean)
         .join(" \u00b7 ");
       main.append(el("div", "jlc-row-sub", sub));
-
       const side = el("div", "jlc-row-side");
       side.append(el("div", "jlc-row-price", firstPrice(comp)));
-      const st = stockLabel(comp);
+      const sl = stockLabel(comp);
       side.append(
-        el("div", "jlc-row-sub " + (st.ok ? "jlc-stock-ok" : "jlc-stock-out"), st.text)
+        el("div", "jlc-row-sub " + (sl.ok ? "jlc-stock-ok" : "jlc-stock-out"), sl.text)
       );
-
       row.append(main, side, el("span", "jlc-caret", "\u203a"));
-      row.addEventListener("click", () => renderDetail(comp));
+      row.addEventListener("click", () => {
+        st.detail = comp;
+        renderShell();
+      });
       body.append(row);
     }
-    if (total && total > MAX_CANDIDATES) {
+    if (st.total && st.total > MAX_CANDIDATES) {
       body.append(
-        el("div", "jlc-note", total.toLocaleString() + " results \u2014 open a row for details.")
+        el("div", "jlc-note", st.total.toLocaleString() + " results \u2014 open a row for details.")
       );
     }
-    renderShell(body);
+    return body;
   }
 
-  function renderDetail(comp) {
-    const body = el("div", "jlc-body");
+  function renderDetailInto(body, comp, source, st) {
+    if ((st.results || []).length > 1) {
+      const back = el("button", "jlc-back", "\u2039 Back to results");
+      back.type = "button";
+      back.addEventListener("click", () => {
+        st.detail = null;
+        renderShell();
+      });
+      body.append(back);
+    }
 
     const head = el("div", "jlc-detail-head");
     if (comp.image) {
@@ -562,11 +667,9 @@
     body.append(head);
 
     const meta = el("dl", "jlc-meta");
-    const st = stockLabel(comp);
+    const sl = stockLabel(comp);
     meta.append(el("dt", null, "Stock"));
-    meta.append(
-      el("dd", st.ok ? "jlc-stock-ok" : "jlc-stock-out", st.text)
-    );
+    meta.append(el("dd", sl.ok ? "jlc-stock-ok" : "jlc-stock-out", sl.text));
     const badge = libBadge(comp);
     if (badge) {
       meta.append(el("dt", null, "Type"));
@@ -582,13 +685,20 @@
       meta.append(el("dt", null, "Category"));
       meta.append(el("dd", null, comp.category));
     }
+    if (comp.name && comp.name !== comp.mpn) {
+      meta.append(el("dt", null, "Name"));
+      meta.append(el("dd", null, comp.name));
+    }
     body.append(meta);
 
     if (comp.prices && comp.prices.length) {
       const table = el("table", "jlc-prices");
       const thead = document.createElement("thead");
       const htr = document.createElement("tr");
-      htr.append(el("th", null, "Qty"), el("th", null, "Unit price (USD)"));
+      htr.append(
+        el("th", null, "Qty"),
+        el("th", null, "Unit price (" + (comp.currency || "USD") + ")")
+      );
       thead.append(htr);
       table.append(thead);
       const tbody = document.createElement("tbody");
@@ -596,12 +706,15 @@
         const tr = document.createElement("tr");
         tr.append(
           el("td", null, fmtQtyRange(p.start, p.end)),
-          el("td", null, fmtPrice(p))
+          el("td", null, fmtPrice(p, comp.currency))
         );
         tbody.append(tr);
       }
       table.append(tbody);
       body.append(table);
+      if (comp.currency === "JPY" && comp.code && !comp.mpn.startsWith("C")) {
+        body.append(el("div", "jlc-note", "Prices include tax."));
+      }
     }
 
     if (comp.moq) {
@@ -651,7 +764,5 @@
       actions.append(a);
     }
     body.append(actions);
-
-    renderShell(body);
   }
 })();

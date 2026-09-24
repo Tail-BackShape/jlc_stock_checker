@@ -13,5 +13,19 @@
       "urlFilter": "||jlcpcb.com/api/overseas-pcb-order/",
       "resourceTypes": ["xmlhttprequest"]
     }
+  },
+  {
+    "id": 2,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "Origin", "operation": "set", "value": "https://www.digikey.com" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||api.digikey.com/",
+      "resourceTypes": ["xmlhttprequest"]
+    }
   }
 ]
